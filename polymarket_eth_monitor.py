@@ -583,21 +583,21 @@ def monitor_market(event, minfo):
                                 slug, label.upper(), price * 100, secs_left)
 
         if settlement_winner:
-            log.info("[%s] Market settled via CLOB streak. Winner: %s", slug, settlement_winner)
+            log.info("[%s] Market settled via CLOB. Winner: %s", slug, settlement_winner)
             record_market_result(slug, alerted, settlement_winner)
             _send_result_message(slug, minfo, alerted, settlement_winner, final_prices=prices)
             return
 
-        # --- Also break if Gamma API says closed ---
-        if minfo["closed"] or not minfo["active"]:
-            log.info("[%s] Market no longer active (Gamma API).", slug)
+        # --- If market time has passed but no CLOB winner yet — poll for winner ---
+        if market_ended:
+            log.info("[%s] Market time elapsed, polling for winner...", slug)
             break
 
         _shutdown.wait(POLL_INTERVAL)
 
-    # Gamma API closed path — wait for winner with CLOB cross-check
-    log.info("[%s] Market closed. Fetching winner...", slug)
-    winner = wait_for_winner(slug, tokens=minfo["tokens"], max_retries=30, delay=10)
+    # Time-based exit — wait for CLOB/Gamma to settle
+    log.info("[%s] Market closed by time. Fetching winner...", slug)
+    winner = wait_for_winner(slug, tokens=minfo["tokens"], max_retries=90, delay=10)
 
     record_market_result(slug, alerted, winner)
     _send_result_message(slug, minfo, alerted, winner, final_prices=None)
