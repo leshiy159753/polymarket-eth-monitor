@@ -593,64 +593,21 @@ def monitor_market(event, minfo):
             _send_result_message(slug, minfo, alerted, settlement_winner, final_prices=prices, end_ts=end_ts)
             return
 
-        # --- If market time has passed but no CLOB winner yet — poll for winner ---
+        # --- Market time passed — declare winner from current CLOB prices only ---
         if market_ended:
-            log.info("[%s] Market time elapsed, polling for winner...", slug)
-            break
+            winner = None
+            for label, price in prices.items():
+                if price is not None and price >= 0.99:
+                    winner = label
+                    log.info("[%s] Winner at close (>= 99%%): %s @ %.2f%%", slug, label.upper(), price * 100)
+                    break
+            if winner is None:
+                log.info("[%s] No token >= 99%% at close time. Winner: unknown", slug)
+            record_market_result(slug, alerted, winner)
+            _send_result_message(slug, minfo, alerted, winner, final_prices=prices, end_ts=end_ts)
+            return
 
         _shutdown.wait(POLL_INTERVAL)
-
-    # Time-based exit — determine winner from CLOB prices at close time.
-    # Strategy:
-    #   1. Fetch fresh CLOB midpoints right now (market just closed).
-    #   2. If any token >= 99% -> that is the winner (clean settlement).
-    #   3. If no token >= 99% -> winner = token with highest price (> 50% means it won).
-    #   4. If CLOB is completely unavailable (all None) -> fallback: poll winnerIndex
-    #      a few times in case Gamma settles quickly.
-    log.info("[%s] Market closed by time. Reading CLOB prices for winner...", slug)
-
-    # Fetch fresh prices at close
-    close_prices = {}
-    for label, token_id in minfo["tokens"].items():
-        if token_id:
-            mid = fetch_midpoint(token_id)
-            if mid is None:
-                mid = minfo["outcome_prices"].get(label)
-            close_prices[label] = mid
-
-    clob_available = any(v is not None for v in close_prices.values())
-
-    winner = None
-    if clob_available:
-        # Step 1: clean 99%+ settlement
-        for label, price in close_prices.items():
-            if price is not None and price >= 0.99:
-                winner = label
-                log.info("[%s] Winner from CLOB (>= 99%%): %s @ %.2f%%", slug, label.upper(), price * 100)
-                break
-
-        # Step 2: majority price winner (no 99% needed -- just who has > 50%)
-        if winner is None:
-            best_label = max(
-                ((lbl, p) for lbl, p in close_prices.items() if p is not None),
-                key=lambda x: x[1],
-                default=(None, None)
-            )
-            if best_label[0] is not None and best_label[1] is not None and best_label[1] > 0.50:
-                winner = best_label[0]
-                log.info("[%s] Winner from CLOB majority price: %s @ %.2f%%",
-                         slug, winner.upper(), best_label[1] * 100)
-            else:
-                log.warning("[%s] CLOB prices ambiguous -- no clear majority winner: %s",
-                            slug, close_prices)
-
-    # Step 3: CLOB unavailable -- brief Gamma fallback (5 retries x 10s)
-    if winner is None:
-        log.info("[%s] CLOB unavailable, trying Gamma API winnerIndex (5 retries)...", slug)
-        winner = wait_for_winner(slug, tokens=minfo["tokens"], max_retries=5, delay=10)
-
-    record_market_result(slug, alerted, winner)
-    _send_result_message(slug, minfo, alerted, winner, final_prices=close_prices, end_ts=end_ts)
 
 def run_monitor():
     log.info("Polymarket ETH Up/Down 15m Monitor starting")
