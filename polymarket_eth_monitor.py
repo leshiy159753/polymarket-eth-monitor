@@ -364,13 +364,8 @@ def wait_for_winner(slug, tokens, max_retries=30, delay=10):
 
         for label, mid in mids.items():
             if mid is not None and mid >= 0.99:
-                # Ignore if all other tokens are ~0% — empty orderbook, not settlement
-                others = [v for lbl, v in mids.items() if lbl != label and v is not None]
-                orderbook_live = any(v > 0.01 for v in others)
-                if not orderbook_live:
-                    log.warning("[%s] wait_for_winner: %s @ %.2f%% IGNORED - empty orderbook",
-                                slug, label.upper(), mid * 100)
-                    continue
+                # After market close, DOWN token legitimately reaches 0% — do NOT apply
+                # the orderbook_live guard here. We are already past end_ts.
                 log.info("[%s] CLOB settlement in wait_for_winner: %s @ %.2f%%",
                          slug, label.upper(), mid * 100)
                 return label
@@ -572,21 +567,24 @@ def monitor_market(event, minfo):
         settlement_winner = None
         for label, price in prices.items():
             if price is not None and price >= 0.99:
-                # Ignore if all other tokens are ~0% — that means empty orderbook, not settlement
-                others = [v for lbl, v in prices.items() if lbl != label and v is not None]
-                orderbook_live = any(v > 0.01 for v in others)
-                if not orderbook_live:
-                    log.warning("[%s] %s @ %.2f%% IGNORED - other tokens at ~0%% (empty orderbook)",
-                                slug, label.upper(), price * 100)
-                    continue
                 if market_ended:
+                    # Market is closed — accept any token at 99%+ as winner.
+                    # The losing token is legitimately at 0% after settlement,
+                    # so we do NOT apply the orderbook_live guard here.
                     log.info("[%s] %s @ %.2f%% - market ended, declaring winner",
                              slug, label.upper(), price * 100)
                     settlement_winner = label
                     break
                 else:
+                    # Mid-market spike guard: only reject if orderbook looks empty
+                    others = [v for lbl, v in prices.items() if lbl != label and v is not None]
+                    orderbook_live = any(v > 0.01 for v in others)
+                    if not orderbook_live:
+                        log.warning("[%s] %s spike to %.2f%% IGNORED - empty orderbook mid-market",
+                                    slug, label.upper(), price * 100)
+                        continue
                     secs_left = end_ts - now_ts
-                    log.warning("[%s] %s spike to %.2f%% IGNORED - %.0fs until market end (from question title)",
+                    log.warning("[%s] %s spike to %.2f%% IGNORED - %.0fs until market end",
                                 slug, label.upper(), price * 100, secs_left)
 
         if settlement_winner:
