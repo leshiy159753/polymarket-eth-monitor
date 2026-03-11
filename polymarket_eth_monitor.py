@@ -451,18 +451,46 @@ def _send_result_message(slug, minfo, alerted, winner, final_prices=None):
     log.info("[%s] RESULT: winner=%s  alerted=%s", slug, winner, alerted_str)
     send_telegram(summary_msg)
 
-def _parse_end_time(minfo):
-    """Parse market end_date into UTC timestamp. Returns None if unparseable."""
-    raw = minfo.get("end_date")
-    if not raw:
+def _parse_end_time_from_question(question: str) -> Optional[float]:
+    """Parse market close time from the question string.
+
+    Handles patterns like:
+      'Ethereum Up or Down - March 11, 11:45AM-12:00PM ET'
+      'Ethereum Up or Down - March 11, 11:45AM-12:00PM UTC'
+    Returns UTC timestamp or None.
+    """
+    import re
+    from zoneinfo import ZoneInfo
+
+    # Match: "Month Day, HH:MMam/pm-HH:MMam/pm TZ"
+    m = re.search(
+        r'(\w+ \d+),\s*\d+:\d+[AP]M[-](\d+:\d+[AP]M)\s*(ET|EST|EDT|UTC)',
+        question, re.IGNORECASE
+    )
+    if not m:
         return None
+
+    date_part = m.group(1)    # e.g. "March 11"
+    time_part = m.group(2)    # e.g. "12:00PM"
+    tz_str    = m.group(3).upper()  # e.g. "ET"
+
+    tz_map = {
+        "ET":  "America/New_York",
+        "EST": "America/New_York",
+        "EDT": "America/New_York",
+        "UTC": "UTC",
+    }
+    tz = ZoneInfo(tz_map.get(tz_str, "America/New_York"))
+
+    year = datetime.now(timezone.utc).year
     try:
-        raw = raw.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except Exception:
+        dt_naive = datetime.strptime(
+            "{} {} {}".format(date_part, year, time_part), "%B %d %Y %I:%M%p"
+        )
+        dt_local = dt_naive.replace(tzinfo=tz)
+        return dt_local.timestamp()
+    except Exception as e:
+        log.debug("_parse_end_time_from_question parse error: %s", e)
         return None
 
 
@@ -473,8 +501,6 @@ def monitor_market(event, minfo):
     log.info("Volume: $%.0f  Liquidity: $%.0f", minfo["volume"], minfo["liquidity"])
 
     alerted = set()
-    high_price_streak = {}       # label -> consecutive poll count at >= 0.99
-    SETTLEMENT_STREAK_REQUIRED = 3  # must hold >= 0.99 for N polls after market end
 
     while not _shutdown.is_set():
         fresh_ev = fetch_event(slug)
@@ -522,28 +548,21 @@ def monitor_market(event, minfo):
         #   1. Current time >= market end_date  (prevents mid-event price spikes)
         #   2. Price >= 0.99 holds for 3 consecutive polls  (prevents single-tick spikes)
         now_ts = time.time()
-        end_ts = _parse_end_time(minfo)
+        end_ts = _parse_end_time_from_question(minfo.get("question", ""))
         market_ended = (end_ts is None) or (now_ts >= end_ts)
 
         settlement_winner = None
         for label, price in prices.items():
             if price is not None and price >= 0.99:
                 if market_ended:
-                    high_price_streak[label] = high_price_streak.get(label, 0) + 1
-                    log.info("[%s] %s @ %.2f%% — streak %d/%d",
-                             slug, label.upper(), price * 100,
-                             high_price_streak[label], SETTLEMENT_STREAK_REQUIRED)
-                    if high_price_streak[label] >= SETTLEMENT_STREAK_REQUIRED:
-                        settlement_winner = label
-                        break
+                    log.info("[%s] %s @ %.2f%% - market ended, declaring winner",
+                             slug, label.upper(), price * 100)
+                    settlement_winner = label
+                    break
                 else:
                     secs_left = end_ts - now_ts
-                    log.warning("[%s] %s spike to %.2f%% IGNORED — %.0fs until market end",
+                    log.warning("[%s] %s spike to %.2f%% IGNORED - %.0fs until market end (from question title)",
                                 slug, label.upper(), price * 100, secs_left)
-            else:
-                if label in high_price_streak:
-                    log.debug("[%s] %s streak reset", slug, label.upper())
-                    high_price_streak.pop(label, None)
 
         if settlement_winner:
             log.info("[%s] Market settled via CLOB streak. Winner: %s", slug, settlement_winner)
