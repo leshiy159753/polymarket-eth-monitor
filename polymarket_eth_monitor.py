@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Polymarket ETH Up/Down 15m Monitor  —  Railway Edition
-=======================================================
-Tracks the current active "Ethereum Up or Down - 15 Minutes" market
-on Polymarket and logs structured state every POLL_INTERVAL seconds.
+Polymarket ETH Up/Down 15m Monitor — Railway Edition
+======================================================
+Логика:
+  1. Каждые POLL_INTERVAL секунд находит текущий активный 15-минутный рынок ETH.
+  2. Следит за ценами токенов UP и DOWN из CLOB API.
+  3. Если цена любого токена опускается до <= ALERT_THRESHOLD (default 0.01, т.е. 1%):
+       - фиксирует событие в памяти (однократно за рынок)
+  4. Когда рынок закрывается (closed=True или active=False):
+       - запрашивает финальный исход (winning outcome)
+       - отправляет итог в Telegram бот
+  5. Переходит к следующему рынку.
 
-Designed for long-running deployment on Railway (or any container host).
-No interactive terminal output; all output goes through Python logging.
-
-Env vars:
-  POLL_INTERVAL   seconds between REST polls          (default: 5)
-  LOG_LEVEL       Python logging level string         (default: INFO)
-
-Optional:
-  pip install websocket-client   enables real-time WS price feed
+Env vars (Railway Variables):
+  TELEGRAM_BOT_TOKEN   — токен бота @BotFather
+  TELEGRAM_CHAT_ID     — chat_id куда слать сообщения
+  POLL_INTERVAL        — секунды между опросами (default: 10)
+  ALERT_THRESHOLD      — порог цены токена (default: 0.01)
+  LOG_LEVEL            — уровень логов (default: INFO)
 """
 
 import json
@@ -28,13 +32,16 @@ from datetime import datetime, timezone
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Config from environment
+# Config
 # ---------------------------------------------------------------------------
-POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "5"))
-LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+POLL_INTERVAL: int    = int(os.getenv("POLL_INTERVAL", "10"))
+LOG_LEVEL: str        = os.getenv("LOG_LEVEL", "INFO").upper()
+ALERT_THRESHOLD: float = float(os.getenv("ALERT_THRESHOLD", "0.01"))
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -45,21 +52,10 @@ logging.basicConfig(
 log = logging.getLogger("polymarket")
 
 # ---------------------------------------------------------------------------
-# Optional WebSocket dependency
-# ---------------------------------------------------------------------------
-try:
-    import websocket
-    WS_AVAILABLE = True
-except ImportError:
-    WS_AVAILABLE = False
-    log.warning("websocket-client not installed — WebSocket feed disabled")
-
-# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 GAMMA_API         = "https://gamma-api.polymarket.com"
 CLOB_API          = "https://clob.polymarket.com"
-WSS_URL           = "wss://ws-subscriptions-clob.polymarket.com/ws/"
 EVENT_SLUG_PREFIX = "eth-updown-15m"
 SLOT_SECONDS      = 900  # 15 minutes
 
@@ -68,23 +64,32 @@ SLOT_SECONDS      = 900  # 15 minutes
 # ---------------------------------------------------------------------------
 _shutdown = threading.Event()
 
-
 def _handle_signal(signum, frame):
-    log.info("Shutdown signal received (sig=%s), stopping...", signum)
+    log.info("Shutdown signal received (%s), stopping...", signum)
     _shutdown.set()
-
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT,  _handle_signal)
 
 # ---------------------------------------------------------------------------
-# Color stubs — plain strings only (Railway logs don't support ANSI)
+# Telegram
 # ---------------------------------------------------------------------------
-def green(s):  return str(s)
-def red(s):    return str(s)
-def yellow(s): return str(s)
-def cyan(s):   return str(s)
-def bold(s):   return str(s)
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("[Telegram] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — skipping send")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        log.info("[Telegram] Message sent OK")
+        return True
+    except Exception as e:
+        log.error("[Telegram] Send error: %s", e)
+        return False
 
 # ---------------------------------------------------------------------------
 # Time helpers
@@ -92,10 +97,8 @@ def bold(s):   return str(s)
 def current_slot_ts() -> int:
     return (int(time.time()) // SLOT_SECONDS) * SLOT_SECONDS
 
-
 def build_slug(ts: int) -> str:
     return f"{EVENT_SLUG_PREFIX}-{ts}"
-
 
 # ---------------------------------------------------------------------------
 # Gamma API
@@ -109,7 +112,6 @@ def fetch_event(slug: str) -> Optional[dict]:
     except Exception as e:
         log.error("[Gamma] fetch_event error: %s", e)
         return None
-
 
 def fetch_active_eth_events(limit: int = 5) -> list:
     try:
@@ -125,7 +127,6 @@ def fetch_active_eth_events(limit: int = 5) -> list:
         log.error("[Gamma] fetch_active_eth_events error: %s", e)
         return []
 
-
 # ---------------------------------------------------------------------------
 # CLOB API
 # ---------------------------------------------------------------------------
@@ -137,41 +138,17 @@ def clob_get(path: str, params: dict = None) -> Optional[dict]:
     except Exception:
         return None
 
-
 def fetch_midpoint(token_id: str) -> Optional[float]:
     d = clob_get("/midpoint", {"token_id": token_id})
     if d and "mid" in d:
         return float(d["mid"])
     return None
 
-
-def fetch_price(token_id: str, side: str) -> Optional[float]:
-    d = clob_get("/price", {"token_id": token_id, "side": side})
-    if d and "price" in d:
-        return float(d["price"])
-    return None
-
-
-def fetch_book(token_id: str) -> Optional[dict]:
-    return clob_get("/book", {"token_id": token_id})
-
-
-def fetch_all_clob(tokens: dict) -> dict:
-    result = {}
-    for label, token_id in tokens.items():
-        if not token_id:
-            continue
-        result[f"{label}_mid"]  = fetch_midpoint(token_id)
-        result[f"{label}_bid"]  = fetch_price(token_id, "buy")
-        result[f"{label}_ask"]  = fetch_price(token_id, "sell")
-        result[f"{label}_book"] = fetch_book(token_id)
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Market parsing
 # ---------------------------------------------------------------------------
 def parse_tokens(market: dict) -> dict:
+    """Возвращает dict вида {'up': 'token_id_...', 'down': 'token_id_...'}"""
     tokens = {}
     raw = market.get("tokens") or market.get("clobTokenIds")
     if isinstance(raw, str):
@@ -198,7 +175,6 @@ def parse_tokens(market: dict) -> dict:
             label = outcomes[i].lower() if i < len(outcomes) else f"outcome_{i}"
             tokens[label] = tid
     return tokens
-
 
 def parse_market(market: dict) -> dict:
     tokens = parse_tokens(market)
@@ -229,6 +205,12 @@ def parse_market(market: dict) -> dict:
                 p = 0.0
         outcome_prices[o.lower()] = p
 
+    # Determine winner (winnerIndex or resolved outcome)
+    winner = None
+    winner_index = market.get("winnerIndex")
+    if winner_index is not None and int(winner_index) < len(outcomes):
+        winner = outcomes[int(winner_index)].lower()
+
     return {
         "condition_id":   market.get("conditionId") or market.get("condition_id", ""),
         "question":       market.get("question", ""),
@@ -239,130 +221,22 @@ def parse_market(market: dict) -> dict:
         "volume":         float(market.get("volume") or 0),
         "liquidity":      float(market.get("liquidity") or 0),
         "end_date":       market.get("endDateIso") or market.get("end_date_iso"),
+        "winner":         winner,
     }
 
-
-# ---------------------------------------------------------------------------
-# Formatting helpers (plain text — no ANSI)
-# ---------------------------------------------------------------------------
-def fmt_pct(p: float) -> str:
-    return f"{p * 100:.1f}%"
-
-
-def fmt_countdown(end_date_str: Optional[str]) -> str:
-    if not end_date_str:
-        return "N/A"
-    try:
-        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-        secs = int((end_dt - datetime.now(timezone.utc)).total_seconds())
-        if secs < 0:
-            return "EXPIRED"
-        m, s = divmod(secs, 60)
-        return f"{m:02d}:{s:02d}"
-    except Exception:
-        return "?"
-
-
-# ---------------------------------------------------------------------------
-# Structured log output
-# ---------------------------------------------------------------------------
-def log_state(event: dict, minfo: dict, clob: dict):
-    slug   = event.get("slug", "?")
-    status = "ACTIVE" if minfo["active"] and not minfo["closed"] else "CLOSED"
-    countdown = fmt_countdown(minfo["end_date"])
-
-    log.info(
-        "market=%s  status=%s  closes_in=%s  volume=$%.0f  liquidity=$%.0f",
-        slug, status, countdown, minfo["volume"], minfo["liquidity"],
-    )
-
-    for label in ["up", "down"]:
-        gp  = minfo["outcome_prices"].get(label, 0.0)
-        mid = clob.get(f"{label}_mid")
-        bid = clob.get(f"{label}_bid")
-        ask = clob.get(f"{label}_ask")
-
-        mid_s = f"{mid * 100:.1f}%" if mid is not None else "--"
-        bid_s = f"{bid * 100:.1f}%" if bid is not None else "--"
-        ask_s = f"{ask * 100:.1f}%" if ask is not None else "--"
-
-        log.info(
-            "  outcome=%-4s  gamma=%s  mid=%s  bid=%s  ask=%s",
-            label.upper(), fmt_pct(gp), mid_s, bid_s, ask_s,
-        )
-
-    # Order book top-3 per side
-    for label in ["up", "down"]:
-        book = clob.get(f"{label}_book")
-        if not book:
-            continue
-        bids = book.get("bids", [])[:3]
-        asks = book.get("asks", [])[:3]
-        ask_line = "  ".join(
-            f"{float(a['price']) * 100:.1f}%x{float(a['size']):.0f}" for a in asks
-        ) or "empty"
-        bid_line = "  ".join(
-            f"{float(b['price']) * 100:.1f}%x{float(b['size']):.0f}" for b in bids
-        ) or "empty"
-        log.info("  book[%s]  asks=%s  bids=%s", label.upper(), ask_line, bid_line)
-
-
-# ---------------------------------------------------------------------------
-# WebSocket monitor (optional)
-# ---------------------------------------------------------------------------
-ws_updates: dict = {}
-
-
-class WSMonitor:
-    def __init__(self, token_ids: list):
-        self.token_ids = token_ids
-        self.ws = None
-        self._t = None
-
-    def _on_open(self, ws):
-        for tid in self.token_ids:
-            ws.send(json.dumps({"auth": {}, "type": "market", "markets": [tid]}))
-        log.info("[WS] Subscribed to %d tokens", len(self.token_ids))
-
-    def _on_message(self, ws, msg):
-        try:
-            d = json.loads(msg)
-            key = d.get("asset_id") or d.get("market", "")
-            if key:
-                ws_updates[key] = d
-        except Exception:
-            pass
-
-    def _on_error(self, ws, err):
-        log.warning("[WS] Error: %s", err)
-
-    def _on_close(self, ws, *a):
-        log.info("[WS] Disconnected")
-
-    def start(self):
-        if not WS_AVAILABLE:
-            return
-        self.ws = websocket.WebSocketApp(
-            WSS_URL,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
-        self._t = threading.Thread(
-            target=self.ws.run_forever,
-            kwargs={"ping_interval": 30},
-            daemon=True,
-        )
-        self._t.start()
-
-    def stop(self):
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
-
+def get_winner_from_event(event: dict) -> Optional[str]:
+    """Получает финальный исход из закрытого события."""
+    markets = event.get("markets", [])
+    if not markets:
+        return None
+    m = parse_market(markets[0])
+    if m["winner"]:
+        return m["winner"]
+    # Fallback: победитель — тот у кого цена = 1.0
+    for label, price in m["outcome_prices"].items():
+        if price >= 0.99:
+            return label
+    return None
 
 # ---------------------------------------------------------------------------
 # Find active market
@@ -384,17 +258,126 @@ def find_active_event():
 
     return None, None
 
+def wait_for_close(slug: str, timeout_sec: int = 1200) -> Optional[dict]:
+    """Ждёт закрытия рынка, возвращает финальный event dict."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline and not _shutdown.is_set():
+        ev = fetch_event(slug)
+        if ev and ev.get("markets"):
+            mi = parse_market(ev["markets"][0])
+            if mi["closed"] or not mi["active"]:
+                log.info("[%s] Market closed.", slug)
+                return ev
+        _shutdown.wait(POLL_INTERVAL)
+    return None
 
 # ---------------------------------------------------------------------------
-# Main monitor loop
+# Core monitoring loop for one market
+# ---------------------------------------------------------------------------
+def monitor_market(event: dict, minfo: dict):
+    slug = event.get("slug", "?")
+    log.info("=== Monitoring market: %s ===", slug)
+    log.info("Question: %s", minfo["question"])
+    log.info("Volume: $%.0f  Liquidity: $%.0f", minfo["volume"], minfo["liquidity"])
+
+    # Track which outcomes have already triggered the low-price alert
+    alerted: set = set()
+
+    while not _shutdown.is_set():
+        # Refresh market state
+        fresh_ev = fetch_event(slug)
+        if fresh_ev and fresh_ev.get("markets"):
+            minfo = parse_market(fresh_ev["markets"][0])
+
+        # Check if market is closed
+        if minfo["closed"] or not minfo["active"]:
+            log.info("[%s] Market no longer active — fetching final outcome.", slug)
+            break
+
+        # Fetch live CLOB midpoint prices
+        tokens = minfo["tokens"]
+        prices = {}
+        for label, token_id in tokens.items():
+            if token_id:
+                mid = fetch_midpoint(token_id)
+                if mid is None:
+                    # fallback to gamma price
+                    mid = minfo["outcome_prices"].get(label)
+                prices[label] = mid
+
+        # Log current state
+        price_str = "  ".join(
+            f"{lbl.upper()}={v*100:.1f}%" if v is not None else f"{lbl.upper()}=N/A"
+            for lbl, v in prices.items()
+        )
+        log.info("[%s] %s", slug, price_str)
+
+        # Check threshold: price <= ALERT_THRESHOLD
+        for label, price in prices.items():
+            if price is None:
+                continue
+            if price <= ALERT_THRESHOLD and label not in alerted:
+                alerted.add(label)
+                msg = (
+                    f"⚠️ <b>Polymarket LOW PRICE ALERT</b>\n"
+                    f"Market: <code>{slug}</code>\n"
+                    f"Outcome: <b>{label.upper()}</b>\n"
+                    f"Price: <b>{price*100:.2f}%</b> (≤ {ALERT_THRESHOLD*100:.0f}%)\n"
+                    f"Question: {minfo['question']}\n"
+                    f"Volume: ${minfo['volume']:.0f}"
+                )
+                log.info("[ALERT] %s price dropped to %.2f%% — sending Telegram", label.upper(), price * 100)
+                send_telegram(msg)
+
+        _shutdown.wait(POLL_INTERVAL)
+
+    # Market closed — get final outcome
+    final_ev = fetch_event(slug)
+    winner = None
+    if final_ev:
+        winner = get_winner_from_event(final_ev)
+
+    # Build result message
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    alerted_str = ", ".join(a.upper() for a in alerted) if alerted else "none"
+
+    if winner:
+        winner_emoji = "🟢" if winner == "up" else "🔴"
+        result_line = f"{winner_emoji} <b>Winner: {winner.upper()}</b>"
+    else:
+        result_line = "❓ <b>Winner: unknown (check manually)</b>"
+
+    # Prices at close
+    final_minfo = parse_market(final_ev["markets"][0]) if (final_ev and final_ev.get("markets")) else minfo
+    final_prices = "  ".join(
+        f"{lbl.upper()}={v*100:.1f}%"
+        for lbl, v in final_minfo["outcome_prices"].items()
+    )
+
+    summary_msg = (
+        f"📊 <b>Polymarket Market Result</b>\n"
+        f"Market: <code>{slug}</code>\n"
+        f"Question: {minfo['question']}\n"
+        f"Closed at: {now_utc}\n"
+        f"{result_line}\n"
+        f"Final prices: {final_prices}\n"
+        f"Volume: ${minfo['volume']:.0f}\n"
+        f"Outcomes that hit ≤{ALERT_THRESHOLD*100:.0f}% during market: {alerted_str}"
+    )
+
+    log.info("[%s] RESULT: winner=%s  alerted=%s", slug, winner, alerted_str)
+    send_telegram(summary_msg)
+
+# ---------------------------------------------------------------------------
+# Main loop
 # ---------------------------------------------------------------------------
 def run_monitor():
     log.info("Polymarket ETH Up/Down 15m Monitor starting")
-    log.info("poll_interval=%ds  log_level=%s  websocket=%s",
-             POLL_INTERVAL, LOG_LEVEL, "enabled" if WS_AVAILABLE else "disabled")
+    log.info("poll=%ds  threshold=%.0f%%  telegram=%s",
+             POLL_INTERVAL, ALERT_THRESHOLD * 100,
+             "configured" if TELEGRAM_BOT_TOKEN else "NOT SET")
 
-    last_slug  = None
-    ws_monitor = None
+    seen_slugs: set = set()
 
     while not _shutdown.is_set():
         event, minfo = find_active_event()
@@ -406,55 +389,19 @@ def run_monitor():
 
         slug = event.get("slug", "")
 
-        if slug != last_slug:
-            log.info("New market detected: %s", slug)
-            if ws_monitor:
-                ws_monitor.stop()
-            token_ids = [v for v in minfo["tokens"].values() if v]
-            ws_monitor = WSMonitor(token_ids)
-            ws_monitor.start()
-            last_slug = slug
+        if slug in seen_slugs:
+            # Already processed this market, wait for next slot
+            log.debug("[%s] Already processed, waiting for next market...", slug)
+            _shutdown.wait(POLL_INTERVAL)
+            continue
 
-        clob = fetch_all_clob(minfo["tokens"])
-        log_state(event, minfo, clob)
-
-        if ws_updates:
-            log.info("[WS] Buffer: %d tokens with live updates", len(ws_updates))
-
-        _shutdown.wait(POLL_INTERVAL)
-
-        # Refresh market state
-        fresh = fetch_event(slug)
-        if fresh and fresh.get("markets"):
-            minfo = parse_market(fresh["markets"][0])
-            event = fresh
+        seen_slugs.add(slug)
+        monitor_market(event, minfo)
 
     log.info("Monitor stopped cleanly.")
-    if ws_monitor:
-        ws_monitor.stop()
-
-
-# ---------------------------------------------------------------------------
-# One-shot snapshot
-# ---------------------------------------------------------------------------
-def run_once(slug: str):
-    log.info("One-shot snapshot: %s", slug)
-    ev = fetch_event(slug)
-    if not ev:
-        log.error("Event not found: %s", slug)
-        sys.exit(1)
-    market = ev["markets"][0] if ev.get("markets") else {}
-    minfo  = parse_market(market)
-    clob   = fetch_all_clob(minfo["tokens"])
-    log_state(ev, minfo, clob)
-
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        target = sys.argv[2] if len(sys.argv) > 2 else build_slug(current_slot_ts())
-        run_once(target)
-    else:
-        run_monitor()
+    run_monitor()
