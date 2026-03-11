@@ -1,33 +1,50 @@
 # Polymarket ETH Up/Down 15m Monitor — Railway Edition
 
-A lightweight Python worker that continuously polls the Polymarket
-**Ethereum Up or Down - 15 Minutes** prediction market and logs structured
-price/probability state to stdout every `POLL_INTERVAL` seconds.
+A Python worker that monitors every 15-minute **Ethereum Up or Down** market on Polymarket.
 
-Designed for headless, long-running deployment on [Railway](https://railway.app)
-or any container platform. All output uses Python's `logging` module —
-no ANSI colour codes, no interactive terminal.
+**What it does:**
+1. Finds the current active 15m ETH market automatically
+2. Polls CLOB prices every `POLL_INTERVAL` seconds
+3. If any outcome price drops to **≤ ALERT_THRESHOLD** (default 1%) — sends a Telegram alert (once per outcome per market)
+4. When the market closes — fetches the final winner and sends a result summary to Telegram
+5. Moves on to the next market automatically
 
 ---
 
-## What It Logs
+## Telegram Messages
 
-Every poll cycle the worker emits structured log lines such as:
-
+**Low price alert** (when UP or DOWN hits ≤ 1%):
 ```
-2026-03-11T14:05:00Z  INFO      market=eth-updown-15m-1773238500  status=ACTIVE  closes_in=07:32  volume=$48231  liquidity=$3120
-2026-03-11T14:05:00Z  INFO        outcome=UP    gamma=54.2%  mid=54.0%  bid=53.5%  ask=54.5%
-2026-03-11T14:05:00Z  INFO        outcome=DOWN  gamma=45.8%  mid=46.0%  bid=45.5%  ask=46.5%
-2026-03-11T14:05:00Z  INFO        book[UP]   asks=54.5%x120  55.0%x80   bids=53.5%x200  53.0%x150
-2026-03-11T14:05:00Z  INFO        book[DOWN] asks=46.5%x90   47.0%x60   bids=45.5%x180  45.0%x100
+⚠️ Polymarket LOW PRICE ALERT
+Market: eth-updown-15m-1773238500
+Outcome: DOWN
+Price: 0.80% (≤ 1%)
+Question: Will ETH be higher in 15 minutes?
+Volume: $48231
+```
+
+**Market result** (on close):
+```
+📊 Polymarket Market Result
+Market: eth-updown-15m-1773238500
+Question: Will ETH be higher in 15 minutes?
+Closed at: 2026-03-11 14:15 UTC
+🟢 Winner: UP
+Final prices: UP=100.0%  DOWN=0.0%
+Volume: $48231
+Outcomes that hit ≤1% during market: DOWN
 ```
 
 ---
 
 ## Deploy to Railway
 
-### 1. Push to GitHub
+### 1. Create Telegram Bot
+1. Message [@BotFather](https://t.me/BotFather) → `/newbot`
+2. Copy the token
+3. Get your chat_id: message [@userinfobot](https://t.me/userinfobot)
 
+### 2. Push to GitHub
 ```bash
 git init
 git add .
@@ -36,70 +53,32 @@ git remote add origin https://github.com/<you>/polymarket-eth-monitor.git
 git push -u origin main
 ```
 
-### 2. Create a Railway project
+### 3. Create Railway project
+1. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**
+2. Select your repository — Railway auto-detects `railway.json`
 
-1. Go to [railway.app](https://railway.app) and click **New Project**.
-2. Choose **Deploy from GitHub repo** and select your repository.
-3. Railway will auto-detect `railway.json` and use Nixpacks to build.
+### 4. Set environment variables
 
-### 3. Set environment variables
+In Railway dashboard → your service → **Variables** tab:
 
-In the Railway dashboard open your service → **Variables** tab and add:
-
-| Variable        | Value  | Notes                          |
-|-----------------|--------|--------------------------------|
-| `POLL_INTERVAL` | `5`    | Seconds between REST polls     |
-| `LOG_LEVEL`     | `INFO` | `DEBUG` / `INFO` / `WARNING`   |
-
-### 4. Deploy
-
-Railway deploys automatically on every push to `main`.
-Check the **Logs** tab to see live output.
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | ✅ | — | Token from @BotFather |
+| `TELEGRAM_CHAT_ID` | ✅ | — | Your Telegram chat ID |
+| `POLL_INTERVAL` | — | `10` | Seconds between polls |
+| `ALERT_THRESHOLD` | — | `0.01` | Price threshold (0.01 = 1%) |
+| `LOG_LEVEL` | — | `INFO` | DEBUG / INFO / WARNING |
 
 ---
 
 ## Run Locally
 
-### Install dependencies
-
 ```bash
 pip install -r requirements.txt
-```
-
-### Continuous monitor (default)
-
-```bash
+cp .env.example .env  # fill in your values
+export $(cat .env | xargs)
 python polymarket_eth_monitor.py
 ```
-
-Override env vars inline:
-
-```bash
-POLL_INTERVAL=10 LOG_LEVEL=DEBUG python polymarket_eth_monitor.py
-```
-
-### One-shot snapshot
-
-Fetch a single snapshot of a specific event slug and exit:
-
-```bash
-python polymarket_eth_monitor.py --once eth-updown-15m-1773238500
-```
-
-Omit the slug to snapshot the current 15-minute slot:
-
-```bash
-python polymarket_eth_monitor.py --once
-```
-
----
-
-## Environment Variables
-
-| Variable        | Default | Description                                                  |
-|-----------------|---------|--------------------------------------------------------------|
-| `POLL_INTERVAL` | `5`     | Seconds between each REST poll cycle                         |
-| `LOG_LEVEL`     | `INFO`  | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`    |
 
 ---
 
@@ -107,22 +86,10 @@ python polymarket_eth_monitor.py --once
 
 ```
 polymarket-railway/
-  polymarket_eth_monitor.py   # Main worker script
-  requirements.txt            # Python dependencies
-  Procfile                    # Railway / Heroku process type
-  railway.json                # Railway build + deploy config
-  .env.example                # Template for local env vars
+  polymarket_eth_monitor.py   # Main worker
+  requirements.txt            # requests>=2.31.0
+  Procfile                    # worker: python polymarket_eth_monitor.py
+  railway.json                # Nixpacks build + restart policy
+  .env.example                # Env vars template
   README.md                   # This file
 ```
-
----
-
-## Notes
-
-- **WebSocket feed** is optional. If `websocket-client` is installed the worker
-  also subscribes to the CLOB real-time feed for live price updates between
-  REST polls. The REST polling path works fine without it.
-- **Graceful shutdown**: the worker handles `SIGTERM` (sent by Railway during
-  deploys/restarts) and exits cleanly after the current poll completes.
-- **Auto-restart**: `railway.json` sets `restartPolicyType: ON_FAILURE` with
-  up to 10 retries, so transient network errors won't kill the deployment.
