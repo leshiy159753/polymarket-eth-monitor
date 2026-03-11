@@ -415,10 +415,12 @@ def _send_result_message(slug, minfo, alerted, winner, final_prices=None, end_ts
         final_prices: dict {label: price_float} from CLOB midpoints, or None
                       (falls back to outcome_prices from minfo)
     """
+    from zoneinfo import ZoneInfo
+    _et_tz = ZoneInfo("America/New_York")
     if end_ts:
-        closed_utc = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        closed_et = datetime.fromtimestamp(end_ts, tz=_et_tz).strftime("%Y-%m-%d %I:%M%p ET")
     else:
-        closed_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        closed_et = datetime.now(_et_tz).strftime("%Y-%m-%d %I:%M%p ET")
     alerted_str = ", ".join(a.upper() for a in alerted) if alerted else "none"
 
     if winner:
@@ -459,7 +461,7 @@ def _send_result_message(slug, minfo, alerted, winner, final_prices=None, end_ts
         "Final prices: {}\n"
         "Volume: ${:.0f}\n"
         "Tokens that hit &lt;={:.0f}%: <b>{}</b>"
-    ).format(slug, minfo["question"], closed_utc, result_line, upset_line,
+    ).format(slug, minfo["question"], closed_et, result_line, upset_line,
              prices_str, minfo["volume"], ALERT_THRESHOLD * 100, alerted_str)
 
     log.info("[%s] RESULT: winner=%s  alerted=%s", slug, winner, alerted_str)
@@ -542,7 +544,9 @@ def monitor_market(event, minfo):
                 continue
             if price <= ALERT_THRESHOLD and label not in alerted:
                 alerted.add(label)
-                now_utc_alert = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                from zoneinfo import ZoneInfo
+                _et_tz = ZoneInfo("America/New_York")
+                now_et_alert = datetime.now(_et_tz).strftime("%Y-%m-%d %I:%M%p ET")
                 msg = (
                     "<b>Polymarket LOW PRICE ALERT</b>\n"
                     "Market: <code>{}</code>\n"
@@ -550,10 +554,10 @@ def monitor_market(event, minfo):
                     "Price: <b>{:.2f}%</b> (&lt;= {:.0f}%)\n"
                     "Question: {}\n"
                     "Volume: ${:.0f}\n"
-                    "Time (UTC): {}"
+                    "Time (ET): {}"
                 ).format(slug, label.upper(), price * 100,
                          ALERT_THRESHOLD * 100, minfo["question"], minfo["volume"],
-                         now_utc_alert)
+                         now_et_alert)
                 log.info("[ALERT] %s price dropped to %.2f%%", label.upper(), price * 100)
                 send_telegram(msg)
 
