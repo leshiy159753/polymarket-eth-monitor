@@ -355,11 +355,22 @@ def wait_for_winner(slug, tokens, max_retries=30, delay=10):
             break
 
         # --- Check CLOB midpoints first (fastest signal) ---
+        mids = {}
         for label, token_id in tokens.items():
             if not token_id:
                 continue
             mid = fetch_midpoint(token_id)
+            mids[label] = mid
+
+        for label, mid in mids.items():
             if mid is not None and mid >= 0.99:
+                # Ignore if all other tokens are ~0% — empty orderbook, not settlement
+                others = [v for lbl, v in mids.items() if lbl != label and v is not None]
+                orderbook_live = any(v > 0.01 for v in others)
+                if not orderbook_live:
+                    log.warning("[%s] wait_for_winner: %s @ %.2f%% IGNORED - empty orderbook",
+                                slug, label.upper(), mid * 100)
+                    continue
                 log.info("[%s] CLOB settlement in wait_for_winner: %s @ %.2f%%",
                          slug, label.upper(), mid * 100)
                 return label
@@ -554,6 +565,13 @@ def monitor_market(event, minfo):
         settlement_winner = None
         for label, price in prices.items():
             if price is not None and price >= 0.99:
+                # Ignore if all other tokens are ~0% — that means empty orderbook, not settlement
+                others = [v for lbl, v in prices.items() if lbl != label and v is not None]
+                orderbook_live = any(v > 0.01 for v in others)
+                if not orderbook_live:
+                    log.warning("[%s] %s @ %.2f%% IGNORED - other tokens at ~0%% (empty orderbook)",
+                                slug, label.upper(), price * 100)
+                    continue
                 if market_ended:
                     log.info("[%s] %s @ %.2f%% - market ended, declaring winner",
                              slug, label.upper(), price * 100)
