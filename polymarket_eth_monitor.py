@@ -404,7 +404,7 @@ def find_active_event():
             return ev, parse_market(ev["markets"][0])
     return None, None
 
-def _send_result_message(slug, minfo, alerted, winner, final_prices=None):
+def _send_result_message(slug, minfo, alerted, winner, final_prices=None, end_ts=None):
     """Build and send the market result Telegram message.
 
     Args:
@@ -415,7 +415,10 @@ def _send_result_message(slug, minfo, alerted, winner, final_prices=None):
         final_prices: dict {label: price_float} from CLOB midpoints, or None
                       (falls back to outcome_prices from minfo)
     """
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if end_ts:
+        closed_utc = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        closed_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     alerted_str = ", ".join(a.upper() for a in alerted) if alerted else "none"
 
     if winner:
@@ -456,7 +459,7 @@ def _send_result_message(slug, minfo, alerted, winner, final_prices=None):
         "Final prices: {}\n"
         "Volume: ${:.0f}\n"
         "Tokens that hit &lt;={:.0f}%: <b>{}</b>"
-    ).format(slug, minfo["question"], now_utc, result_line, upset_line,
+    ).format(slug, minfo["question"], closed_utc, result_line, upset_line,
              prices_str, minfo["volume"], ALERT_THRESHOLD * 100, alerted_str)
 
     log.info("[%s] RESULT: winner=%s  alerted=%s", slug, winner, alerted_str)
@@ -585,7 +588,7 @@ def monitor_market(event, minfo):
         if settlement_winner:
             log.info("[%s] Market settled via CLOB. Winner: %s", slug, settlement_winner)
             record_market_result(slug, alerted, settlement_winner)
-            _send_result_message(slug, minfo, alerted, settlement_winner, final_prices=prices)
+            _send_result_message(slug, minfo, alerted, settlement_winner, final_prices=prices, end_ts=end_ts)
             return
 
         # --- If market time has passed but no CLOB winner yet — poll for winner ---
@@ -600,7 +603,7 @@ def monitor_market(event, minfo):
     winner = wait_for_winner(slug, tokens=minfo["tokens"], max_retries=90, delay=10)
 
     record_market_result(slug, alerted, winner)
-    _send_result_message(slug, minfo, alerted, winner, final_prices=None)
+    _send_result_message(slug, minfo, alerted, winner, final_prices=None, end_ts=end_ts)
 
 def run_monitor():
     log.info("Polymarket ETH Up/Down 15m Monitor starting")
