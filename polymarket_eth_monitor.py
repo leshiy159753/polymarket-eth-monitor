@@ -336,11 +336,35 @@ def get_winner_from_market(market_dict):
             return label
     return None
 
-def wait_for_winner(slug, max_retries=30, delay=10):
+def wait_for_winner(slug, tokens, max_retries=30, delay=10):
+    """Wait for a winner to be determined.
+
+    Checks CLOB midpoint prices first on each attempt — if any token
+    reaches >= 0.99 that label is returned immediately.  Falls back to
+    winnerIndex from the Gamma API.
+
+    Args:
+        slug: market slug string
+        tokens: dict {label: token_id} for CLOB midpoint lookups
+        max_retries: number of polling attempts
+        delay: seconds between attempts
+    """
     log.info("[%s] Waiting for winner (up to %ds)...", slug, max_retries * delay)
     for attempt in range(max_retries):
         if _shutdown.is_set():
             break
+
+        # --- Check CLOB midpoints first (fastest signal) ---
+        for label, token_id in tokens.items():
+            if not token_id:
+                continue
+            mid = fetch_midpoint(token_id)
+            if mid is not None and mid >= 0.99:
+                log.info("[%s] CLOB settlement in wait_for_winner: %s @ %.2f%%",
+                         slug, label.upper(), mid * 100)
+                return label
+
+        # --- Fall back to Gamma API winnerIndex ---
         ev = fetch_event(slug)
         if ev and ev.get("markets"):
             market_dict = ev["markets"][0]
@@ -369,6 +393,64 @@ def find_active_event():
             return ev, parse_market(ev["markets"][0])
     return None, None
 
+def _send_result_message(slug, minfo, alerted, winner, final_prices=None):
+    """Build and send the market result Telegram message.
+
+    Args:
+        slug: market slug string
+        minfo: parsed market info dict
+        alerted: set of label strings that triggered alerts
+        winner: winning label string or None
+        final_prices: dict {label: price_float} from CLOB midpoints, or None
+                      (falls back to outcome_prices from minfo)
+    """
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    alerted_str = ", ".join(a.upper() for a in alerted) if alerted else "none"
+
+    if winner:
+        winner_emoji = "\U0001f4c8" if winner == "up" else "\U0001f4c9"  # up arrow / down arrow
+        result_line = "<b>Winner: {} {}</b>".format(winner.upper(), winner_emoji)
+    else:
+        result_line = "<b>Winner: unknown - check Polymarket manually</b>"
+
+    upset_line = ""
+    if alerted and winner:
+        if winner in alerted:
+            upset_line = "\n<b>UPSET! &lt;={:.0f}% token WON!</b>".format(ALERT_THRESHOLD * 100)
+        else:
+            upset_line = "\nFavourite won (&lt;={:.0f}% token lost as expected)".format(ALERT_THRESHOLD * 100)
+
+    # Build final prices string
+    if final_prices:
+        prices_str = "  ".join(
+            "{0}={1:.1f}%".format(lbl.upper(), v * 100)
+            for lbl, v in final_prices.items()
+            if v is not None
+        )
+    else:
+        # Fallback: re-fetch from Gamma API outcome_prices
+        final_ev = fetch_event(slug)
+        final_minfo = parse_market(final_ev["markets"][0]) if (final_ev and final_ev.get("markets")) else minfo
+        prices_str = "  ".join(
+            "{0}={1:.1f}%".format(lbl.upper(), v * 100)
+            for lbl, v in final_minfo["outcome_prices"].items()
+        )
+
+    summary_msg = (
+        "<b>Polymarket Market Result</b>\n"
+        "Market: <code>{}</code>\n"
+        "Question: {}\n"
+        "Closed at: {}\n"
+        "{}{}\n"
+        "Final prices: {}\n"
+        "Volume: ${:.0f}\n"
+        "Tokens that hit &lt;={:.0f}%: <b>{}</b>"
+    ).format(slug, minfo["question"], now_utc, result_line, upset_line,
+             prices_str, minfo["volume"], ALERT_THRESHOLD * 100, alerted_str)
+
+    log.info("[%s] RESULT: winner=%s  alerted=%s", slug, winner, alerted_str)
+    send_telegram(summary_msg)
+
 def monitor_market(event, minfo):
     slug = event.get("slug", "?")
     log.info("=== Monitoring market: %s ===", slug)
@@ -381,10 +463,6 @@ def monitor_market(event, minfo):
         fresh_ev = fetch_event(slug)
         if fresh_ev and fresh_ev.get("markets"):
             minfo = parse_market(fresh_ev["markets"][0])
-
-        if minfo["closed"] or not minfo["active"]:
-            log.info("[%s] Market no longer active.", slug)
-            break
 
         tokens = minfo["tokens"]
         prices = {}
@@ -401,67 +479,56 @@ def monitor_market(event, minfo):
         )
         log.info("[%s] %s", slug, price_str)
 
+        # --- Alert on low price ---
         for label, price in prices.items():
             if price is None:
                 continue
             if price <= ALERT_THRESHOLD and label not in alerted:
                 alerted.add(label)
+                now_utc_alert = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                 msg = (
                     "<b>Polymarket LOW PRICE ALERT</b>\n"
                     "Market: <code>{}</code>\n"
                     "Outcome: <b>{}</b>\n"
                     "Price: <b>{:.2f}%</b> (&lt;= {:.0f}%)\n"
                     "Question: {}\n"
-                    "Volume: ${:.0f}"
+                    "Volume: ${:.0f}\n"
+                    "Time (UTC): {}"
                 ).format(slug, label.upper(), price * 100,
-                         ALERT_THRESHOLD * 100, minfo["question"], minfo["volume"])
+                         ALERT_THRESHOLD * 100, minfo["question"], minfo["volume"],
+                         now_utc_alert)
                 log.info("[ALERT] %s price dropped to %.2f%%", label.upper(), price * 100)
                 send_telegram(msg)
 
+        # --- Check for settlement via CLOB prices (most reliable signal) ---
+        settlement_winner = None
+        for label, price in prices.items():
+            if price is not None and price >= 0.99:
+                settlement_winner = label
+                log.info("[%s] CLOB settlement detected: %s @ %.2f%%",
+                         slug, label.upper(), price * 100)
+                break
+
+        if settlement_winner:
+            log.info("[%s] Market settled via CLOB price. Winner: %s", slug, settlement_winner)
+            # Record and send result immediately, don't wait for winnerIndex
+            record_market_result(slug, alerted, settlement_winner)
+            _send_result_message(slug, minfo, alerted, settlement_winner, final_prices=prices)
+            return
+
+        # --- Also break if Gamma API says closed ---
+        if minfo["closed"] or not minfo["active"]:
+            log.info("[%s] Market no longer active (Gamma API).", slug)
+            break
+
         _shutdown.wait(POLL_INTERVAL)
 
+    # Gamma API closed path — wait for winner with CLOB cross-check
     log.info("[%s] Market closed. Fetching winner...", slug)
-    winner = wait_for_winner(slug, max_retries=30, delay=10)
+    winner = wait_for_winner(slug, tokens=minfo["tokens"], max_retries=30, delay=10)
 
     record_market_result(slug, alerted, winner)
-
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    alerted_str = ", ".join(a.upper() for a in alerted) if alerted else "none"
-
-    if winner:
-        winner_emoji = "UP" if winner == "up" else "DOWN"
-        result_line = "<b>Winner: {} ({})</b>".format(winner.upper(), winner_emoji)
-    else:
-        result_line = "<b>Winner: unknown - check Polymarket manually</b>"
-
-    upset_line = ""
-    if alerted and winner:
-        if winner in alerted:
-            upset_line = "\n<b>UPSET! &lt;={:.0f}% token WON!</b>".format(ALERT_THRESHOLD * 100)
-        else:
-            upset_line = "\nFavourite won (&lt;={:.0f}% token lost as expected)".format(ALERT_THRESHOLD * 100)
-
-    final_ev = fetch_event(slug)
-    final_minfo = parse_market(final_ev["markets"][0]) if (final_ev and final_ev.get("markets")) else minfo
-    final_prices = "  ".join(
-        "{0}={1:.1f}%".format(lbl.upper(), v * 100)
-        for lbl, v in final_minfo["outcome_prices"].items()
-    )
-
-    summary_msg = (
-        "<b>Polymarket Market Result</b>\n"
-        "Market: <code>{}</code>\n"
-        "Question: {}\n"
-        "Closed at: {}\n"
-        "{}{}\n"
-        "Final prices: {}\n"
-        "Volume: ${:.0f}\n"
-        "Tokens that hit &lt;={:.0f}%: <b>{}</b>"
-    ).format(slug, minfo["question"], now_utc, result_line, upset_line,
-             final_prices, minfo["volume"], ALERT_THRESHOLD * 100, alerted_str)
-
-    log.info("[%s] RESULT: winner=%s  alerted=%s", slug, winner, alerted_str)
-    send_telegram(summary_msg)
+    _send_result_message(slug, minfo, alerted, winner, final_prices=None)
 
 def run_monitor():
     log.info("Polymarket ETH Up/Down 15m Monitor starting")
