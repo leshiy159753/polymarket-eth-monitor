@@ -28,7 +28,7 @@ from typing import Optional
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "0.01"))
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "0.10"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATS_FILE = os.getenv("STATS_FILE", "stats.json")
